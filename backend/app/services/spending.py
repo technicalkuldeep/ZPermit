@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.spending import Permit, PermitCategory, PermitMerchant, PurchaseRequest, utcnow
+from app.models.bitrefill import PurchaseExecution
 from app.schemas.spending import PermitCreate, PermitOut, PurchaseCreate, PurchaseOut, SpendingSummary
 
 
@@ -77,7 +78,7 @@ class SpendingService:
         permits = self.session.scalars(select(Permit).where(Permit.owner_id == owner_id).order_by(Permit.created_at, Permit.id))
         return [self.permit_output(permit) for permit in permits]
 
-    def policy_denial(self, permit: Permit, purchase: PurchaseRequest) -> str | None:
+    def policy_denial(self, permit: Permit, purchase: PurchaseRequest, *, exclude_own_reservation: bool = False) -> str | None:
         # Stable ordering gives deterministic reasons when multiple rules fail.
         if permit.status != 'active':
             return 'permit_revoked'
@@ -95,7 +96,10 @@ class SpendingService:
             return 'category_not_allowed'
         if purchase.amount_cents > permit.per_purchase_limit_cents:
             return 'per_purchase_limit_exceeded'
-        if purchase.amount_cents > self.summary(permit).remaining_cents:
+        remaining = self.summary(permit).remaining_cents
+        if exclude_own_reservation and purchase.state == 'authorized':
+            remaining += purchase.amount_cents
+        if purchase.amount_cents > remaining:
             return 'insufficient_budget'
         return None
 
@@ -154,6 +158,7 @@ class SpendingService:
 
     def cancel(self, request_id: str, role: str, subject: str):
         purchase = self.visible_purchase(request_id, role, subject)
+        self.require_no_checkout(purchase.id)
         return self.transition(purchase, {'pending_approval', 'authorized'}, 'cancelled', 'cancelled')
 
     def revoke(self, permit_id: str, owner_id: str):
@@ -164,13 +169,29 @@ class SpendingService:
             PurchaseRequest.state.in_(['pending_approval', 'authorized']),
         )).all()
         for purchase in purchases:
+            if self.checkout_holds_reservation(purchase.id):
+                continue
             self.transition(purchase, {'pending_approval', 'authorized'}, 'cancelled', 'permit_revoked')
         self.session.flush()
         return self.permit_output(permit)
 
     # Internal trusted settlement transitions ONLY. No HTTP routes expose these.
-    def mark_fulfilled(self, request_id: str):
+    def checkout_holds_reservation(self, request_id: str) -> bool:
+        return self.session.scalar(select(PurchaseExecution.id).where(
+            PurchaseExecution.purchase_request_id == request_id,
+            PurchaseExecution.state.not_in(['delivered', 'failed']),
+        )) is not None
+
+    def require_no_checkout(self, request_id: str):
+        if self.checkout_holds_reservation(request_id):
+            raise DomainError(409, 'Checkout requires reconciliation; reservation cannot be released')
+
+    def mark_fulfilled(self, request_id: str, *, provider_verified: bool = False):
+        if not provider_verified:
+            self.require_no_checkout(request_id)
         return self.transition(self.purchase(request_id), {'authorized'}, 'fulfilled')
 
-    def mark_failed(self, request_id: str):
+    def mark_failed(self, request_id: str, *, provider_verified: bool = False):
+        if not provider_verified:
+            self.require_no_checkout(request_id)
         return self.transition(self.purchase(request_id), {'authorized'}, 'failed', 'fulfillment_failed')

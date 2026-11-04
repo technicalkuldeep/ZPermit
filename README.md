@@ -1,8 +1,9 @@
 # ZPermit
 
 Privacy-conscious AI spending authorization platform for the Free Society Hackathon.
-Milestones 1–2 provide a FastAPI backend and deterministic permit policy engine.
-Authorization reserves a budget; **no payments or purchases are executed**.
+Milestones 1–3 provide FastAPI spending authorization and a server-owned Bitrefill
+integration boundary. **Live checkout remains blocked pending contract verification;
+no payments or purchases have been executed.**
 
 ## Installation and startup
 
@@ -111,7 +112,8 @@ start with a letter/digit, and are at most 128 characters. Permit lists are
 nonempty, deduplicated, normalized child tables with composite primary keys,
 not comma-separated strings or substring filters. Product and external request
 IDs are opaque, case-sensitive strings; they are not claims of verified prices
-or catalog provenance. No merchant integration exists in this milestone.
+or catalog provenance. Bitrefill discovery and preparation are described below; proposal values alone
+never establish a verified checkout price.
 
 Policy checks have a stable order: active permit, unexpired permit, matching
 agent, supported currency, positive amount, allowed merchant, allowed category,
@@ -137,8 +139,9 @@ authorized -> fulfilled | failed | cancelled
 Terminal states cannot transition again. Remaining budget equals total limit
 minus fulfilled spend minus authorized reservations. Fulfillment moves reserved
 money to spent without charging the budget twice. Failure and cancellation
-release the reservation. Revoking a permit cancels all pending/authorized
-requests atomically and preserves fulfilled spend. Revocation is idempotent.
+release the reservation. Revoking a permit cancels pending/authorized requests atomically and preserves
+fulfilled spend. Requests with an initiated or uncertain Bitrefill checkout keep
+their reservation until reconciliation; cancellation cannot release those funds. Revocation is idempotent.
 Expiry blocks submissions and approvals; it does not automatically release an
 existing reservation. Those reservations remain accounted for until explicitly
 cancelled, failed, fulfilled, or revoked. There is no settlement worker yet.
@@ -268,5 +271,166 @@ backend/app/
 backend/tests/
 ```
 
-There is no frontend, Bitrefill, Zcash, AI orchestration, payment integration,
-or fake purchase implementation.
+There is no frontend, Zcash, AI orchestration, payment execution, or fake purchase
+implementation. Bitrefill live checkout is explicitly blocked as explained below.
+
+## Milestone 3: Bitrefill discovery and guarded preparation
+
+Official references: [eCommerce MCP](https://docs.bitrefill.com/docs/ecommerce-mcp),
+[API overview](https://docs.bitrefill.com/docs/api-overview),
+[partner guide](https://docs.bitrefill.com/docs/mcp-partner-integration-guide).
+The backend uses the official hosted MCP at `https://api.bitrefill.com/mcp` with a
+server-side API key in the Authorization header. It decodes JSON and TOON read
+results, including SSE envelopes. Credentials never go in URLs or agent payloads.
+
+**Current blocker:** the public documentation does not establish a complete
+pre-checkout quote contract proving final USD cost, fees, availability and quote
+validity, or a checkout price-bound guarantee. No Bitrefill credential is currently
+configured to inspect the authenticated contract. Discovery uses minimal documented
+fields and rejects unsupported response layouts. Live preparation persists a
+**blocked** preview (`quote_contract_unverified`) with null cost, rather than
+inventing a quote. Live checkout cannot dispatch `buy-products`, even if its
+safety flag is enabled. See [contract verification and blockers](backend/docs/bitrefill-contract.md).
+
+After updating dependencies, rerun schema initialization. This adds the preview
+and execution tables to an existing Milestone 2 database without altering its
+permit/request tables or data:
+
+```bash
+cd backend
+source .venv/bin/activate
+python -m pip install -e '.[dev]'
+python -m app.core.init_db
+```
+
+Additional environment settings (keep real keys only in `.env` or secret storage):
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `BITREFILL_API_KEY` | unset | Server account API key; required for real reads |
+| `BITREFILL_LIVE_PURCHASES_ENABLED` | `false` | Necessary, never sufficient, for checkout |
+| `ZPERMIT_BITREFILL_TIMEOUT_SECONDS` | `10` | Per-network-operation timeout, 0.1–30 seconds |
+| `ZPERMIT_BITREFILL_PREVIEW_TTL_SECONDS` | `60` | Local preview lifetime cap, 1–300 seconds |
+
+The two unprefixed Bitrefill variables also accept `ZPERMIT_` aliases. Restart
+after setting them. Missing/rejected credentials return 503; provider timeouts
+return 504. Read-only transient failures retry at most once with backoff; rate
+limits do not retry automatically. Errors/logs contain fixed codes, never raw
+provider messages or bodies. Read calls do not create orders or reserve funds.
+OAuth guest accounts and invoice access-token storage are not supported.
+
+With `BASE`, `AGENT_TOKEN`, and `OWNER_TOKEN` set as in the earlier walkthrough:
+
+```bash
+# Read-only search. intent is required by the current MCP partner guide.
+curl --fail-with-body -sS --get "$BASE/api/bitrefill/products" \
+  -H "Authorization: Bearer $AGENT_TOKEN" \
+  --data-urlencode 'query=Amazon' --data-urlencode 'country=US' \
+  --data-urlencode 'intent=Find a US gift card for an owner-approved purchase'
+
+# Use an exact id returned by search; the ID below is a documented example.
+curl --fail-with-body -sS "$BASE/api/bitrefill/products/amazon_com-usa" \
+  -H "Authorization: Bearer $AGENT_TOKEN"
+```
+
+Search can include `product_type` if supported by the account's actual tool.
+Gift cards, phone refills and eSIMs share the normalized product response. The
+response exposes available denomination labels/ranges and recipient requirements
+when present. Unknown availability/cost stays null. It never forwards raw objects,
+gift-card codes, invoice tokens, checkout links or eSIM installation material.
+
+The exact product slug is the permit's merchant identifier. The documented
+product type (`gift_card`, `phone_refill` or `esim`) is its category. No brand-name
+substring inference is performed. Unknown types block preparation. Use these
+server-returned values to create the permit and proposal; a proposed product ID,
+merchant or category must match independently fetched product information.
+
+Preparation accepts an **existing** visible purchase request. It can run while
+owner approval is pending but cannot reserve pending funds or perform checkout:
+
+```bash
+# Set REQUEST_ID to an existing ZPermit request. Set denomination to a value
+# returned by product details, not the full compound package_id.
+curl --fail-with-body -sS "$BASE/api/bitrefill/purchase-previews" \
+  -H "Authorization: Bearer $AGENT_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"purchase_request_id\":\"$REQUEST_ID\",\"denomination\":\"10\"}"
+
+# For a required recipient, add recipient to preparation and later confirmation.
+# Recipient values are not persisted: only a keyed digest binds the confirmation.
+```
+
+A ready preview (once the live quote contract is verified) binds product snapshot,
+denomination, recipient digest, exact USD cost, payment method and expiry with a
+fingerprint. The workflow requires the quote to equal the request's immutable
+amount exactly. If a price differs, cancel the old uninitiated request and create
+a new proposal using the verified amount; no authorization or idempotency payload
+is silently changed. New cost must pass all permit rules and approval thresholds.
+A preview never changes the budget itself. Re-preparing creates a new preview and
+fingerprint; only one execution is allowed across all previews of that request.
+
+Owner approval of the spending request and owner confirmation of the exact
+checkout are separate steps:
+
+```bash
+# Only if the spending request is pending_approval:
+curl --fail-with-body -sS -X POST "$BASE/api/purchase-requests/$REQUEST_ID/approve" \
+  -H "Authorization: Bearer $OWNER_TOKEN"
+
+# Future owner-confirmed checkout boundary. Currently returns 503 when disabled
+# or blocked by the live contract, and NEVER produces a fake invoice.
+# PREVIEW_ID and FINGERPRINT must come from a ready, unexpired preview.
+curl --fail-with-body -sS "$BASE/api/bitrefill/purchase-previews/$PREVIEW_ID/execute" \
+  -H "Authorization: Bearer $OWNER_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"preview_fingerprint\":\"$FINGERPRINT\",\"confirm\":true}"
+```
+
+A normal agent credential receives 403 for execution. The service re-fetches
+fresh details/quote and rechecks the permit, expiry, approval, remaining budget,
+product, exact price and preview before committing a unique initiating record.
+An increased or otherwise changed price requires fresh preparation and consent.
+The initiating record is durable before a possible write. Uncertain outcomes
+remain reserved and cannot be retried, cancelled or force-released.
+
+To eventually enable real checkout: first resolve and test every contract blocker
+listed in the linked verification document, including billing requirements and a
+provider-enforced exact-price guarantee. Then explicitly configure the safety
+flag, restart, prepare a fresh quote, approve any pending spending request, review
+its precise product/denomination/USD price and submit the owner confirmation with
+that preview's fingerprint. **Enabling the flag alone currently cannot purchase.**
+No balance, cashback, saved-card charge, x402 settlement or payment route exists.
+
+Owner-only execution lookup and reconciliation (for genuine persisted executions):
+
+```bash
+curl --fail-with-body -sS "$BASE/api/bitrefill/executions/$EXECUTION_ID" \
+  -H "Authorization: Bearer $OWNER_TOKEN"
+curl --fail-with-body -sS -X POST "$BASE/api/bitrefill/executions/$EXECUTION_ID/reconcile" \
+  -H "Authorization: Bearer $OWNER_TOKEN"
+```
+
+Poll no faster than every 10 seconds. Invoice created, unpaid, payment detected,
+paid, and delivered are distinct; invoice creation alone never fulfills a request.
+Completion requires exactly one delivered order for the expected product. Failed
+or blocked statuses retain funds; only a verified refunded order releases a failed
+purchase here. Unknown or contradictory statuses require reconciliation. Terminal
+settlement is idempotent. If the provider never returned an invoice ID, contact
+Bitrefill support: there is no undocumented lookup, manual attachment, automatic
+retry or unsafe force-release path. A process crash may leave `initiating`; this
+also holds the budget and needs reconciliation. No background poller or secret
+redemption delivery endpoint is included.
+
+All automated provider tests are isolated mocks with real network transports
+blocked. Normalized quote fixtures test the security workflow; they are not
+assertions about Bitrefill's production pricing schema. Documentation and the
+public schema were fetched live, but authenticated catalog reads and invoices
+have **not** been verified live because no credential is configured. No live
+`buy-products` call was made and no funds or credits were spent.
+
+Optional read-only verification from `backend/`:
+
+```bash
+python -m app.integrations.verify_bitrefill
+```
+
+This skips without a credential. With a credential it calls only search and
+details, prints a count and product ID, and never creates an invoice or pays.

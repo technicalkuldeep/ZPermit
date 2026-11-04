@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from pydantic import SecretStr, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     dev_agent_id: str = "shopping-agent"
     dev_owner_credential: SecretStr | None = None
     dev_agent_credential: SecretStr | None = None
+    bitrefill_api_key: SecretStr | None = Field(default=None, validation_alias=AliasChoices(
+        "BITREFILL_API_KEY", "ZPERMIT_BITREFILL_API_KEY"))
+    bitrefill_live_purchases_enabled: bool = Field(default=False, validation_alias=AliasChoices(
+        "BITREFILL_LIVE_PURCHASES_ENABLED", "ZPERMIT_BITREFILL_LIVE_PURCHASES_ENABLED"))
+    bitrefill_timeout_seconds: float = Field(default=10, ge=0.1, le=30)
+    bitrefill_preview_ttl_seconds: int = Field(default=60, ge=1, le=300)
 
     @field_validator("dev_owner_id", "dev_agent_id")
     @classmethod
