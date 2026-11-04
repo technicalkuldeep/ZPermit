@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from pydantic import field_validator
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +18,17 @@ class Settings(BaseSettings):
 
     database_url: str = "sqlite:///./zpermit.db"
     cors_origins: list[str] = []
+    dev_owner_id: str = "development-owner"
+    dev_agent_id: str = "shopping-agent"
+    dev_owner_credential: SecretStr | None = None
+    dev_agent_credential: SecretStr | None = None
+
+    @field_validator("dev_owner_id", "dev_agent_id")
+    @classmethod
+    def validate_identity(cls, value: str) -> str:
+        if not value.strip() or len(value) > 128:
+            raise ValueError("Development identities must contain 1 to 128 characters")
+        return value.strip()
 
     @field_validator("database_url")
     @classmethod

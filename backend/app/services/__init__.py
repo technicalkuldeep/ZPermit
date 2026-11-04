@@ -1,1 +1,1 @@
-"""Application services (added in later milestones)."""
+"""Domain policy and transaction services."""

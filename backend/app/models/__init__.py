@@ -1,1 +1,1 @@
-"""SQLAlchemy models (added in later milestones)."""
+"""Persistent SQLAlchemy domain models."""
