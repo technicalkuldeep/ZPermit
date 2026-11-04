@@ -1,6 +1,25 @@
 # Milestone 4 compatibility report — 2026-11-04
 
-## Decision and local evidence
+## Current continuation: Zingo Mobile external signing
+
+The owner clarified that the existing funded testnet wallet is **Zingo Mobile on
+a phone**, not Ubuntu. No more desktop search/installation is needed. No new
+wallet is created, restored or imported. Follow the
+[phone payment-request and evidence workflow](zingo-public-testnet.md).
+
+ZPermit generates a single-recipient ZIP-321 link and QR from real validated
+request terms. [ZIP-321](https://zips.z.cash/zip-0321) defines exact decimal amounts
+and unpadded base64url memos (512 bytes maximum). The installed mobile build's
+scanner/link behavior remains unverified; owner review/manual field entry is the
+fallback. The phone handles fees, explicit approval, signing and sending.
+
+Existing public-service verification remains read-only and existing Zallet routes
+remain separate. Chain confirmation cannot prove private recipient, amount, memo
+or sender; mobile request/txid associations are owner-reported and never settle
+purchase requests. Earlier live reads verified NU7 77190ad9, Ironwood and real
+transaction lookup on testnet.zec.rocks:443, not an owner payment.
+
+## Original Zallet decision and local evidence
 
 Ubuntu 24.04 x86_64; Python environment available. `command -v` found none of
 `zallet`, `zebrad`, `zcash-cli`, `zcashd`, or `zingocli`. No wallet or funded

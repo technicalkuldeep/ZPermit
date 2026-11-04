@@ -6,19 +6,21 @@ price fields or enable buy-products until that contract is independently verifie
 import json
 import logging
 import time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from uuid import uuid4
+from datetime import timedelta
+from app.models.spending import utcnow
 from typing import NoReturn
 
 import httpx
 import toon_format
 
 from app.core.config import Settings
-from app.schemas.bitrefill import CreatedInvoice, Denomination, InvoiceObservation, Product, Quote
+from app.schemas.bitrefill import AccountBalance, CreatedInvoice, Denomination, InvoiceObservation, Product, Quote
 
 logger = logging.getLogger(__name__)
 MCP_URL = 'https://api.bitrefill.com/mcp'
-READ_TOOLS = {'search-products', 'get-product-details', 'get-invoice-by-id'}
+READ_TOOLS = {'search-products', 'get-product-details', 'get-invoice-by-id', 'get-balances', 'list-invoices'}
 PROVIDER_CODES = {'VALIDATION_ERROR', 'INVALID_INPUT', 'RESOURCE_NOT_FOUND', 'PERMISSION_DENIED',
                   'SERVICE_UNAVAILABLE', 'PAYMENT_UNCERTAIN', 'INTERNAL_ERROR'}
 INVOICE_STATES = {'unpaid', 'payment_detected', 'payment_confirmed', 'pending', 'complete',
@@ -126,7 +128,9 @@ class BitrefillClient:
     def _product(self, raw: dict) -> Product:
         try:
             # Documented product and package fields only; no raw response forwarding.
-            product_id = bounded_string(raw['id'])
+            product_id = bounded_string(raw.get('slug') or raw.get('id'))
+            if raw.get('slug') and raw.get('id') and raw['slug'] != raw['id']:
+                raise ProviderError('product_identity_mismatch')
             packages = raw.get('packages', [])
             if not isinstance(packages, list) or len(packages) > 1000:
                 raise ProviderError('unsupported_response_contract')
@@ -136,7 +140,12 @@ class BitrefillClient:
                 if value is not None:
                     if isinstance(value, bool) or not isinstance(value, (str, int, Decimal)):
                         raise ProviderError('unsupported_response_contract')
-                    denominations.append(Denomination(package_value=bounded_string(str(value))))
+                    denominations.append(Denomination(
+                        package_value=bounded_string(str(value)),
+                        package_currency=package.get('package_currency'),
+                        payment_currency=package.get('payment_currency'),
+                        payment_price_cents=usd_cents(package['payment_price'])
+                        if package.get('payment_currency') == 'USD' and package.get('payment_price') is not None else None))
             range_data = raw.get('range')
             value_range = None
             if isinstance(range_data, dict) and all(key in range_data for key in ('min', 'max', 'step')):
@@ -145,8 +154,16 @@ class BitrefillClient:
             for key in ('name', 'country', 'currency', 'recipient_type'):
                 if raw.get(key) is not None:
                     optional[key] = bounded_string(raw[key], 200)
+            if raw.get('country_code') is not None:
+                optional['country'] = bounded_string(raw['country_code'])
+            if optional.get('recipient_type') == 'none':
+                optional['recipient_type'] = None
             product_type = raw.get('type')
-            return Product(id=product_id, product_type=bounded_string(product_type) if product_type else None,
+            return Product(id=product_id, slug=raw.get('slug'),
+                           available=raw.get('in_stock') if type(raw.get('in_stock')) is bool else None,
+                           accepts_balance=('balance' in raw['payment_methods']['balance'])
+                           if isinstance(raw.get('payment_methods'), dict) and isinstance(raw['payment_methods'].get('balance'), list) else None,
+                           product_type=bounded_string(product_type) if product_type else None,
                            denominations=denominations, denomination_range=value_range,
                            requires_prepayment=bool(raw.get('prepayment')), **optional)
         except (ValueError, TypeError, KeyError, AttributeError):
@@ -171,12 +188,41 @@ class BitrefillClient:
         return product
 
     def quote(self, product: Product, denomination: str, recipient: str | None) -> Quote:
-        # Public docs do not establish final USD cost incl. fees, availability or
-        # price-lock validity. Denomination/face value and USDC are NOT USD cost.
-        raise ProviderError('quote_contract_unverified', 503)
+        if product.accepts_balance is not True:
+            raise ProviderError('unsupported_payment_method', 409)
+        package = next((p for p in product.denominations if p.package_value == denomination), None)
+        if package is None or package.payment_currency != 'USD' or package.payment_price_cents is None:
+            raise ProviderError('payment_price_unverified', 409)
+        if product.available is not True:
+            raise ProviderError('availability_unverified', 409)
+        self.ensure_balance(package.payment_price_cents)
+        # This expiry is local freshness only, NEVER a provider price lock.
+        return Quote(product=product, denomination=denomination, total_cents=package.payment_price_cents,
+                     currency='USD', payment_method='balance', balance_currency='USD',
+                     final_charge_bounded=False,
+                     expires_at=utcnow() + timedelta(seconds=self.settings.bitrefill_preview_ttl_seconds))
+
+    def balance(self) -> AccountBalance:
+        raw = self._rpc('get-balances', {'currency': 'USD'})
+        try:
+            entries = [b for b in raw['balances'] if b.get('payment_method') == 'balance'
+                       and b.get('balance_currency') == 'USD']
+            if len(entries) != 1:
+                raise ProviderError('balance_contract_unverified')
+            entry = entries[0]
+            cents = usd_cents(entry['amount'], allow_zero=True)
+            if type(entry['amount_base']) is not int or entry['amount_base'] != cents or entry['decimals'] != 2:
+                raise ProviderError('balance_contract_unverified')
+            return AccountBalance(amount_cents=cents)
+        except (KeyError, TypeError, ValueError):
+            raise ProviderError('balance_contract_unverified') from None
+
+    def ensure_balance(self, required_cents: int):
+        if self.balance().amount_cents < required_cents:
+            raise ProviderError('insufficient_balance', 409)
 
     def ensure_checkout_supported(self) -> NoReturn:
-        raise ProviderError('checkout_contract_unverified', 503)
+        raise ProviderError('maximum_debit_unbounded', 503)
 
     def create_invoice(self, quote: Quote, recipient: str | None) -> CreatedInvoice:
         if not self.settings.bitrefill_live_purchases_enabled:
@@ -196,8 +242,21 @@ class BitrefillClient:
             return InvoiceObservation(
                 invoice_id=invoice_id, invoice_status=status if status in INVOICE_STATES else 'unknown',
                 order_statuses=[order.get('status') if order.get('status') in ORDER_STATES else 'unknown' for order in orders],
-                product_ids=[bounded_string(order['product']['id']) if isinstance(order.get('product'), dict)
-                             and 'id' in order['product'] else '' for order in orders],
+                product_ids=[bounded_string(order['product'].get('slug') or order['product'].get('id')) if isinstance(order.get('product'), dict)
+                             and ('id' in order['product'] or 'slug' in order['product']) else '' for order in orders],
             )
         except (KeyError, TypeError, AttributeError, ValueError):
             raise ProviderError('unsupported_response_contract') from None
+
+
+def usd_cents(value, allow_zero=False) -> int:
+    """Exact USD base units; never round a malformed or sub-cent price."""
+    try:
+        if isinstance(value, bool) or not isinstance(value, (str, int, Decimal)):
+            raise ValueError()
+        amount = Decimal(value) * 100
+        if not amount.is_finite() or amount != amount.to_integral_value() or amount < (0 if allow_zero else 1) or amount > 10**12:
+            raise ValueError()
+        return int(amount)
+    except (ValueError, InvalidOperation):
+        raise ProviderError('payment_price_unverified') from None

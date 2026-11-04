@@ -55,7 +55,7 @@ class MockProvider:
 
     def quote(self, product, denomination, recipient):
         return Quote(product=product, denomination=denomination, total_cents=self.cost,
-                     currency='USD', payment_method='fiat_card', expires_at=utcnow() + timedelta(minutes=3))
+                     currency='USD', payment_method='fiat_card', final_charge_bounded=True, expires_at=utcnow() + timedelta(minutes=3))
 
     def ensure_checkout_supported(self):
         pass
@@ -170,7 +170,6 @@ def test_price_mismatch_blocks_preparation_without_budget_mutation(world, provid
     ({'product_type': 'phone_refill'}, 'category_mismatch'),
     ({'available': False}, 'availability_unverified'),
     ({'available': None}, 'availability_unverified'),
-    ({'currency': 'USDC'}, 'unsupported_currency'),
     ({'requires_prepayment': True}, 'prepayment_not_supported'),
     ({'denominations': [Denomination(package_value='10')]}, 'invalid_denomination'),
 ])
@@ -429,7 +428,7 @@ def test_mcp_details_denomination_is_not_a_quote():
     assert product.available is None
     with pytest.raises(ProviderError, match='Bitrefill') as exc:
         client.quote(product, '8', None)
-    assert exc.value.code == 'quote_contract_unverified'
+    assert exc.value.code == 'unsupported_payment_method'
 
 
 def test_mcp_invoice_response_filters_codes_and_tokens():
@@ -497,7 +496,7 @@ def test_real_adapter_never_dispatches_buy_even_if_switch_enabled(live):
                   payment_method='fiat_card', expires_at=utcnow() + timedelta(minutes=1))
     with pytest.raises(ProviderError) as exc:
         client.create_invoice(quote, None)
-    assert exc.value.code == ('checkout_contract_unverified' if live else 'live_purchases_disabled')
+    assert exc.value.code == ('maximum_debit_unbounded' if live else 'live_purchases_disabled')
 
 
 def test_live_adapter_persists_blocked_preview_instead_of_inventing_price(world):
@@ -509,7 +508,7 @@ def test_live_adapter_persists_blocked_preview_instead_of_inventing_price(world)
     world.client.app.state.bitrefill_provider = provider
     preview = prepare(world, request).json()
     assert preview['state'] == 'blocked'
-    assert preview['blocker'] == 'quote_contract_unverified'
+    assert preview['blocker'] == 'unsupported_payment_method'
     assert preview['amount_cents'] is None
 
 
@@ -659,3 +658,113 @@ def test_bitrefill_environment_switch_and_secret_masking(monkeypatch):
     assert config.bitrefill_api_key.get_secret_value() == key
     assert config.bitrefill_live_purchases_enabled is True
     assert key not in repr(config)
+
+
+@pytest.mark.parametrize('slug,cents', [('swiggy-money-india',55), ('flipkart-india',56), ('google-play-india',57)])
+def test_authenticated_product_shape_and_usd_balance(slug, cents):
+    # Sanitized projection of authenticated MCP reads, 2026-11-04.
+    def handle(request):
+        rpc = json.loads(request.content)['params']
+        if rpc['name'] == 'get-balances':
+            assert rpc['arguments'] == {'currency':'USD'}
+            return mcp_response(request, {'balances':[{'payment_method':'balance', 'balance_currency':'USD',
+                'amount':'25.00', 'amount_base':2500, 'decimals':2}]}, toon=True)
+        return mcp_response(request, {'id':slug, 'country_code':'IN', 'currency':'INR',
+            'recipient_type':'none', 'in_stock':True,
+            'packages':[{'package_value':'50','package_currency':'INR',
+                         'payment_price':f'0.{cents}', 'payment_currency':'USD'}],
+            'payment_methods':{'balance':['balance','cashback']}}, toon=True)
+    client = BitrefillClient(client_settings(), httpx.MockTransport(handle))
+    product = client.details(slug)
+    assert product.country == 'IN' and product.product_type is None
+    assert product.recipient_type is None and product.currency == 'INR'
+    quote = client.quote(product, '50', None)
+    assert quote.total_cents == cents and quote.currency == 'USD'
+    assert quote.payment_method == 'balance' and quote.balance_currency == 'USD'
+    assert quote.final_charge_bounded is False
+    assert client.balance().amount_cents == 2500
+    with pytest.raises(ProviderError) as error:
+        client.ensure_checkout_supported()
+    assert error.value.code == 'maximum_debit_unbounded'
+
+
+def test_slug_identity_and_missing_metadata():
+    client = BitrefillClient(client_settings())
+    product = client._product({'slug':'swiggy-money-india'})
+    assert product.id == product.slug == 'swiggy-money-india'
+    assert product.country is None and product.product_type is None
+    with pytest.raises(ProviderError):
+        client._product({'slug':'one', 'id':'another'})
+
+
+@pytest.mark.parametrize('price', [None, '', 'NaN', '-1', '0', '0.001', True, 0.55])
+def test_invalid_payment_prices_fail_closed(price):
+    client = BitrefillClient(client_settings())
+    raw = {'id':'shop', 'in_stock':True, 'payment_methods':{'balance':['balance']},
+           'packages':[{'package_value':'50', 'payment_currency':'USD', 'payment_price':price}]}
+    with pytest.raises(ProviderError):
+        client.quote(client._product(raw), '50', None)
+
+
+@pytest.mark.parametrize('entries', [[], [{'payment_method':'cashback','balance_currency':'USD'}],
+    [{'payment_method':'balance','balance_currency':'USD','amount':'25.00','amount_base':25,'decimals':2}]])
+def test_balance_contract_mismatch(entries):
+    client = BitrefillClient(client_settings(), httpx.MockTransport(lambda r: mcp_response(r, {'balances':entries})))
+    with pytest.raises(ProviderError):
+        client.balance()
+
+
+def test_insufficient_usd_balance_has_no_fallback():
+    calls = []
+    def handle(request):
+        calls.append(json.loads(request.content)['params']['name'])
+        return mcp_response(request, {'balances':[{'payment_method':'balance', 'balance_currency':'USD',
+            'amount':'0.54','amount_base':54,'decimals':2}]})
+    client = BitrefillClient(client_settings(), httpx.MockTransport(handle))
+    with pytest.raises(ProviderError) as error:
+        client.ensure_balance(55)
+    assert error.value.code == 'insufficient_balance'
+    assert calls == ['get-balances']
+
+
+def test_indicative_quote_cannot_bypass_cap_with_acknowledgement(world, provider):
+    _, request = purchase(world)
+    original = provider.quote
+    provider.quote = lambda *args: original(*args).model_copy(update={'final_charge_bounded':False})
+    preview = prepare(world, request).json()
+    assert preview['blocker'] == 'maximum_debit_unbounded'
+    world.settings.bitrefill_live_purchases_enabled = True
+    assert execute(world, preview, acknowledge_uncertain_final_charge=True).status_code == 409
+    assert provider.buy_calls == 0
+
+
+def test_inr_face_value_does_not_change_usd_reservation(world, provider):
+    _, request = purchase(world)
+    provider.product.currency = 'INR'
+    preview = prepare(world, request).json()
+    assert preview['state'] == 'ready'
+    assert preview['currency'] == 'USD' and preview['amount_cents'] == 800
+
+
+def test_non_usd_payment_quote_is_rejected():
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        Quote(product=Product(id='shop', currency='INR'), denomination='50', total_cents=55,
+              currency='INR', payment_method='balance', balance_currency='USD',
+              expires_at=utcnow() + timedelta(minutes=1))
+
+
+def test_balance_endpoint_requires_owner_and_returns_only_usd_cents(world, provider):
+    from app.schemas.bitrefill import AccountBalance
+    provider.balance = lambda: AccountBalance(amount_cents=2500)
+    assert world.client.get('/api/bitrefill/balance', headers=world.agent).status_code == 403
+    response = world.client.get('/api/bitrefill/balance', headers=world.owner)
+    assert response.status_code == 200
+    assert response.json() == {'payment_method':'balance','balance_currency':'USD','amount_cents':2500}
+
+
+def test_quote_is_unbounded_unless_server_explicitly_establishes_guarantee():
+    quote = Quote(product=Product(id='shop'), denomination='50', total_cents=55,
+                  currency='USD', payment_method='balance', balance_currency='USD',
+                  expires_at=utcnow()+timedelta(minutes=1))
+    assert quote.final_charge_bounded is False

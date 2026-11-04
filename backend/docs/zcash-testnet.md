@@ -5,7 +5,18 @@ No real transaction ID has been produced. See the
 [compatibility report](zcash-compatibility.md) for dated primary sources and local
 checks. Unit fixtures are synthetic and are never submission evidence.
 
-## Required setup with a mentor
+## Prefer the existing Zingo/public lightwallet path first
+
+The [Zingo reuse and public-service guide](zingo-public-testnet.md) is the current
+preferred route. Real read-only NU7/Ironwood connectivity and transaction lookup
+work without a full node, and GUI signing avoids opening private wallet files.
+The owner uses an existing funded Zingo Mobile wallet on a phone. No desktop
+installation/search or new wallet is required; the phone approves and signs.
+Do not install or sync Zebra merely to use that path. This document preserves the
+existing **optional Zallet** integration; none of its approval, durable claim or
+uncertainty protections has been replaced.
+
+## Optional Zallet setup with a mentor
 
 1. Obtain the hackathon's actual developer-resource packet; its URL was not in
    this repository or the public event description. Have the mentor confirm the

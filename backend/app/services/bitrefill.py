@@ -72,6 +72,8 @@ class BitrefillWorkflow:
             raise DomainError(409, 'product_mismatch')
         if product.merchant != purchase.merchant:
             raise DomainError(409, 'merchant_mismatch')
+        if not quote.final_charge_bounded:
+            raise DomainError(409, 'maximum_debit_unbounded')
         if product.category not in {'gift_card', 'phone_refill', 'esim'} or product.category != purchase.category:
             raise DomainError(409, 'category_mismatch')
         if product.available is not True:
@@ -93,12 +95,14 @@ class BitrefillWorkflow:
             raise DomainError(409, 'invalid_recipient')
         if recipient is not None and (not recipient.strip() or len(recipient) > 254):
             raise DomainError(409, 'invalid_recipient')
-        if purchase.currency != 'USD' or quote.currency != 'USD' or product.currency != 'USD':
+        if purchase.currency != 'USD' or quote.currency != 'USD':
             raise DomainError(409, 'unsupported_currency')
         # Preserve immutable agent idempotency payload and the owner's authorized
         # price. A changed price requires a NEW proposal, never a silent mutation.
         if quote.total_cents != purchase.amount_cents:
             raise DomainError(409, 'quoted_price_mismatch')
+        if quote.payment_method == 'balance' and quote.balance_currency != 'USD':
+            raise DomainError(409, 'unsupported_currency')
         if quote.expires_at <= utcnow():
             raise DomainError(409, 'quote_expired')
         permit = svc.permit(purchase.permit_id)

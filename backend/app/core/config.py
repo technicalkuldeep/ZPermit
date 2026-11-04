@@ -17,6 +17,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    public_demo: bool = False
     database_url: str = "sqlite:///./zpermit.db"
     cors_origins: list[str] = []
     dev_owner_id: str = "development-owner"
@@ -29,6 +30,11 @@ class Settings(BaseSettings):
         "BITREFILL_LIVE_PURCHASES_ENABLED", "ZPERMIT_BITREFILL_LIVE_PURCHASES_ENABLED"))
     bitrefill_timeout_seconds: float = Field(default=10, ge=0.1, le=30)
     bitrefill_preview_ttl_seconds: int = Field(default=60, ge=1, le=300)
+
+    zcash_public_reads_enabled: bool = False
+    zcash_public_receiving_address: str = ""
+    zcash_public_inspector_binary: str = str(
+        Path(__file__).resolve().parents[2] / "tools/zcash-public-inspect/target/release/zpermit-public-inspect")
 
     zcash_network: Literal["test"] = "test"
     zcash_enabled: bool = False

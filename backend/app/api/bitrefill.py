@@ -2,10 +2,10 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Path, Query, Request
+from fastapi import APIRouter, Depends, Path, Query, Request, Response
 
 from app.core.security import Identity, development_identity, owner_identity
-from app.schemas.bitrefill import ConfirmInput, ExecutionOut, PrepareInput, PreviewOut, Product
+from app.schemas.bitrefill import AccountBalance, ConfirmInput, ExecutionOut, PrepareInput, PreviewOut, Product
 from app.services.bitrefill import BitrefillWorkflow
 
 router = APIRouter(prefix='/api/bitrefill', tags=['Bitrefill'])
@@ -57,3 +57,16 @@ def get_execution(execution_id: UUID, identity: Identity = Depends(owner_identit
 @router.post('/executions/{execution_id}/reconcile', response_model=ExecutionOut)
 def reconcile(execution_id: UUID, identity: Identity = Depends(owner_identity), svc=Depends(workflow)):
     return svc.reconcile(str(execution_id), identity)
+
+
+@router.get('/balance', response_model=AccountBalance)
+def account_balance(request: Request, identity: Identity = Depends(owner_identity)):
+    return request.app.state.bitrefill_provider.balance()
+
+
+@router.get('/invoices/{invoice_id}')
+def read_invoice(invoice_id: UUID, request: Request, response: Response,
+                 identity: Identity = Depends(owner_identity)):
+    """Read-only account invoice observation; never attaches or settles a request."""
+    response.headers['Cache-Control'] = 'no-store'
+    return request.app.state.bitrefill_rest_reader.inspect_invoice(str(invoice_id))

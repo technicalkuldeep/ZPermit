@@ -1,9 +1,19 @@
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
+from fastapi.staticfiles import StaticFiles
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from sqlalchemy.exc import OperationalError
+
+from app.api.workspace import router as workspace_router
+from app.integrations.verify_bitrefill_rest import RestAccessVerifier
+
+from app.api.mobile_payment import router as mobile_payment_router
+from app.api.public_testnet import router as public_testnet_router
+from app.integrations.public_testnet import PublicTestnetClient
 
 from app.api.zcash import router as zcash_router
 from app.integrations.zcash import ZalletAdapter, ZcashError
@@ -32,7 +42,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.settings = config
     application.state.database_engine = engine
     application.state.bitrefill_provider = BitrefillClient(config)
+    application.state.bitrefill_rest_reader = RestAccessVerifier(config)
     application.state.zcash_wallet = ZalletAdapter(config)
+    application.state.public_testnet = PublicTestnetClient(config)
 
     @application.exception_handler(ZcashError)
     async def zcash_error(request: Request, exc: ZcashError):
@@ -61,11 +73,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["GET", "POST"],
         allow_headers=["Accept", "Content-Type", "Authorization"],
     )
+    @application.get('/api/mode', tags=['Application mode'])
+    def mode():
+        return {'mode': 'private_local', 'sample_data': False, 'can_spend': False}
+
+    application.include_router(workspace_router)
+    application.include_router(mobile_payment_router)
+    application.include_router(public_testnet_router)
     application.include_router(zcash_router)
     application.include_router(health_router)
     application.include_router(spending_router)
     application.include_router(bitrefill_router)
+    frontend_dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+    if (frontend_dist / "index.html").is_file():
+        # Serve only the app shell/assets. Unknown /api routes must stay JSON 404s.
+        @application.get("/overview", include_in_schema=False)
+        @application.get("/permits", include_in_schema=False)
+        @application.get("/shop", include_in_schema=False)
+        @application.get("/requests", include_in_schema=False)
+        @application.get("/payments", include_in_schema=False)
+        @application.get("/evidence", include_in_schema=False)
+        @application.get("/connection", include_in_schema=False)
+        @application.get("/", include_in_schema=False)
+        def frontend_index():
+            return FileResponse(frontend_dist / "index.html", headers={"Cache-Control": "no-cache"})
+
+        if (frontend_dist / "assets").is_dir():
+            application.mount("/assets", StaticFiles(directory=frontend_dist / "assets"), name="frontend-assets")
     return application
 
 
-app = create_app()
+# A public demo process must never load the private local .env as a side effect.
+app = (create_app(Settings(_env_file=None, database_url='sqlite://',
+                       BITREFILL_API_KEY=None, BITREFILL_LIVE_PURCHASES_ENABLED=False,
+                       dev_owner_credential=None, dev_agent_credential=None,
+                       zcash_enabled=False, zcash_live_broadcast_enabled=False,
+                       zcash_public_reads_enabled=False))
+       if os.environ.get('ZPERMIT_PUBLIC_DEMO', '').lower() in {'1', 'true'} else create_app())

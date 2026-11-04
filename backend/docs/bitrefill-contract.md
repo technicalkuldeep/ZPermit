@@ -1,117 +1,101 @@
-# Bitrefill contract verification — 2026-11-04
+# Bitrefill authenticated contract review — 2026-11-04
 
-Read before implementing; recheck before enabling any checkout capability.
+Official contract: https://docs.bitrefill.com/docs/mcp-partner-integration-guide
+Authenticated `tools/list`, `get-balances`, search and product details were read.
+No buy-products call was made. Keys stay server-side in Authorization headers.
 
-Official sources:
+## Observed fields
 
-- https://docs.bitrefill.com/docs/ecommerce-mcp
-- https://docs.bitrefill.com/docs/api-overview
-- https://docs.bitrefill.com/docs/mcp-partner-integration-guide
-- https://docs.bitrefill.com/docs/core-concepts
-- https://docs.bitrefill.com/docs/quickstart-2
-- https://github.com/bitrefill/cli (README documents decoded `products` search output)
-- https://api.bitrefill.com/openapi.json (downloaded; describes x402, not a complete MCP output schema)
-- https://github.com/toon-format/toon-python (official TOON decoder)
+Search products use `slug`; details use `id` with the same slug value. Both map
+to Product.id (the stable policy identifier); conflicting identities fail closed.
+Details expose country_code, currency (face currency), recipient_type=none,
+in_stock, packages[].package_value/package_currency/payment_price/payment_currency,
+and payment_methods.balance containing balance and cashback. Product type is
+absent for these three products. It stays unknown; food categories, names and
+country are not used to invent an authorization category.
 
-## Verified from documentation
+Verified normalized products, all in stock and balance eligible:
 
-Hosted server: `https://api.bitrefill.com/mcp`. Stateless Streamable HTTP,
-JSON-RPC 2.0, `tools/call`; Accept must include JSON and event-stream. Read
-responses are TOON; tool errors have `isError` and a JSON error object. An API
-key in Authorization is supported for server-owned accounts. The newer partner
-guide explicitly prohibits putting keys in URLs, superseding the older setup
-example. OAuth guest lifecycle/access-token storage is deliberately not added.
+| Product | Face value | Indicative USD payment cents |
+| --- | --- | --- |
+| swiggy-money-india | INR 50 | 55 |
+| flipkart-india | INR 50 | 56 |
+| google-play-india | INR 50 | 57 |
 
-Read tool inputs:
+get-balances(currency=USD) returned balances[].payment_method=balance,
+balance_currency=USD, amount="25.00", amount_base=2500, decimals=2. The adapter
+checks both representations and rejects missing, contradictory or duplicate
+USD balance entries. It never uses equivalent_in_product_currency or converts INR
+into a permit amount. All reservations remain integer USD cents.
 
-- `search-products`: query, required intent, country, optional product_type,
-  per_page (20 here, below the documented maximum).
-- `get-product-details`: product_id, currency (USD here).
-- `get-invoice-by-id`: invoice_id, for the server account that owns it.
+## Checkout remains blocked
 
-Minimal whitelisted read fields:
+Authenticated buy-products schema: cart_items (1..15), product_id slug,
+package_value string, optional refill_input/bill_payment_id/gift; payment_method;
+balance_currency (USD/EUR/BTC/XBT); return_payment_link; billing_address;
+saved_fiat_card_id; coupon_code. Its annotations declare readOnlyHint=false,
+destructiveHint=true, idempotentHint=false. Balance auto-debits immediately.
+There is no verified max-charge argument, quote ID, price-lock or idempotency key.
 
-- Search root `products` (official CLI example); product id/name/type/country/
-  currency from the product documentation. No guessed alternative field names.
-- Details: product fields, packages[].package_value, range.min/max/step,
-  recipient_type, presence of prepayment. Unknown layouts return a structured
-  error rather than being guessed. REST `packages[].value` is NOT silently
-  substituted for MCP `package_value`.
-- Invoice: invoice_id, invoice_status, orders[].status; order product.id from
-  core concepts binds settlement to a product. Without this binding the workflow
-  retains funds and requires reconciliation.
-- Documented invoice progress includes unpaid, payment_detected,
-  payment_confirmed, pending and complete. Documented order states distinguish
-  delivered, failed and refunded. Failed is not sufficient proof of refund.
+The catalog price is indicative. Quote.expires_at is local freshness only.
+Live quotes explicitly set final_charge_bounded=false. They cannot pass policy
+validation. ensure_checkout_supported raises maximum_debit_unbounded, even with
+the owner live flag enabled. The transport cannot dispatch buy-products.
+Acknowledging uncertainty cannot override a hard cap. No final debit is guaranteed.
+The adapter supports USD balance assessment, not live balance debit.
 
-These are documentation-based adapters, **not captured authenticated schemas**.
-There is no configured Bitrefill credential in this workspace. If the actual
-MCP nests or names these fields differently, the adapter fails closed and must
-be updated from an authenticated, sanitized read capture, not guessed aliases.
+Owner checkpoint: existing owner-only execute route requires an authorized
+request, matching preview fingerprint and confirm=true. The confirmation schema
+also accepts acknowledge_uncertain_final_charge; it grants no bypass. Do not
+enable live purchasing for this contract. A safe purchase requires a provider
+maximum-debit guarantee (or separately reviewed payment contract that enforces
+one), authoritative policy category metadata, and implementation/review of that
+contract. Merely approving 55 cents does not constrain Bitrefill to 55 cents.
 
-## Explicit blockers
+## Execution and reconciliation
 
-The public pages do not define a complete machine-verifiable priced detail
-response establishing all of:
+Existing workflow uses SQLite BEGIN IMMEDIATE plus unique request/preview
+execution constraints; the initiating claim commits before any potential write.
+Policy, product, USD payment price, authorization and (for balance quotes) fresh
+USD balance are checked before the claim. One durable record permits one attempt.
+Every post-claim error freezes execution with reservations held. No checkout retry
+exists. Revoke/cancel cannot release an unresolved execution's reservation.
 
-1. Product availability and authoritative product type/recipient requirements.
-2. Exact final USD amount including fees for the chosen denomination and method.
-3. Distinction between product face currency, display currency and charge currency.
-4. Quote expiry/price-lock validity before invoice creation.
-5. A supported checkout mechanism that binds the exact approved total (or a
-   provider guarantee that an invoice cannot charge more than that total).
-6. The current authenticated `buy-products` input/output schema. The older guide
-   uses package_id; the newer partner guide uses package_value. Fiat card methods
-   also require billing address fields; these are not guessed or collected yet.
+Known invoice IDs reconcile through get-invoice-by-id, bound to the expected
+product. Complete + delivered settles once; verified refund releases. Missing or
+contradictory records retain funds. Slug and id are supported in nested product
+identities. Unknown invoice IDs require manual account-history/provider review;
+list-invoices is a supported read capability, but no automatic timestamp matching,
+manual attachment, or force-release is provided. There is no reliable provider
+request identifier for automatic reconciliation after an unknown debit.
 
-Consequently `BitrefillClient.quote()` always returns a structured
-`quote_contract_unverified` error; preparation persists a **blocked** preview
-with no invented amount. `ensure_checkout_supported()` always refuses checkout.
-`create_invoice()` also checks the disabled-by-default live switch. The transport
-has a hard read-tool allowlist: it cannot dispatch buy-products at all in this
-milestone. No balance, cashback, saved-card, invoice-pay or x402-pay call exists.
+Future within-policy agent checkout can use the same claim/policy boundary only
+once a bounded provider contract exists. Agents must never receive credentials or
+a direct buy-products capability. The first purchase retains owner confirmation.
 
-Switching the flag on does not resolve this blocker. Before shipping checkout,
-verify those contracts with Bitrefill, implement and test the exact adapter and
-billing inputs, and repeat contract review. Keep balance/cashback unavailable.
-Do not substitute denomination, USDC, or a locally computed exchange rate for USD.
+## Review commands
 
-The internal `Quote` and mock provider are ZPermit domain contracts, not claims
-about Bitrefill's response schema. Normalized test doubles exercise the complete
-security boundary while the live adapter is blocked. There are no synthetic
-invoices in production code.
+```sh
+cd ~/Projects/ZPermit/backend
+.venv/bin/pytest -q
+.venv/bin/python -m app.integrations.verify_bitrefill
+```
 
-## Reconciliation constraints
+The verifier uses only authenticated balance/search/details reads and prints
+whitelisted summaries. It does not change gates, create invoices or spend funds.
 
-The execution row is durable before a possible network write. Unknown outcomes
-retain funds and cannot be retried. If no invoice ID was returned/persisted, this
-milestone cannot discover one by request id: provider idempotency/lookup support
-is not documented. Contact provider support using the UTC initiation timestamp;
-there is no unsafe manual invoice attachment or force-release endpoint.
+## REST two-stage follow-up
 
-When a genuine invoice ID is available, owner-only reconciliation uses a read
-call. Complete plus exactly one delivered order for the expected product becomes
-fulfilled. A verified refunded order for that product becomes failed/released.
-A failed order, blocked invoice, missing association, malformed response, timeout,
-or contradictory progress retains the budget. Public outputs contain no raw
-provider objects, payment links, invoice access tokens, codes or eSIM activation
-material. This milestone does not deliver purchased secret material to users.
+See [REST assessment](bitrefill-rest-assessment.md) for authenticated personal
+REST read verification and the separate invoice-create/pay contract review.
+Two stages are documented, but USD sub-account selection, expiration and an
+immutable final debit remain unverified. The MCP purchase blocker is unchanged.
+No invoice-creation probe is permitted without the owner's separate approval.
 
-## Test/live distinction
+## Current checkout recommendation
 
-Automated tests block all real HTTP transports. Protocol fixtures exercise only
-specified read fields, with JSON and TOON/SSE envelopes; they are not production
-captures. Workflow tests use an explicitly named normalized MockProvider, including
-mock initiation timeouts and statuses. They neither pay nor call live buy-products.
-
-Only documentation and the public OpenAPI document were fetched live during
-implementation. Authenticated product search/details and invoice lookup could not
-be verified because no Bitrefill credentials are configured. No invoice was
-created and no account funds/credits were used.
-
-The authorization linearization point for future checkout is the committed
-`initiating` record. Revocation before that point prevents initiation; revocation
-afterwards cannot undo a possibly dispatched provider call and must preserve the
-reservation. A database transaction cannot atomically revoke a remote side effect.
-The final policy check and fresh quote precede that record; no provider write is
-currently implemented, so this boundary has only been tested with isolated mocks.
+See [hackathon decision](bitrefill-checkout-recommendation.md). One unpaid REST
+invoice was subsequently created with separate owner approval; that approval is
+consumed. Existing invoice reads show BTC-labelled raw price 682, no verified USD
+debit guarantee. MCP explicitly selects USD but has no verified max charge.
+Quote bounds now default false; live checkout remains blocked.

@@ -26,3 +26,29 @@ venv/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Read-only public-data decoder build artifacts
+backend/tools/zcash-public-inspect/target/
+
+# Frontend and browser verification
+node_modules/
+*.tsbuildinfo
+playwright-report/
+test-results/
+
+# Private experiments, wallet material and local artifacts
+backend/docs/experiments/
+*.log
+*.tmp
+*.pem
+*.key
+wallet.dat
+wallets/
+*.wallet
+secrets/
+.aws/
+.codex/
+.local/
+id_rsa*
+id_ed25519*
+service-account*.json

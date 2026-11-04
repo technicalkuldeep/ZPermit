@@ -10,10 +10,14 @@ from app.schemas.spending import Input, Money
 
 class Denomination(BaseModel):
     package_value: str
+    package_currency: str | None = None
+    payment_price_cents: Money | None = None
+    payment_currency: str | None = None
 
 
 class Product(BaseModel):
     id: str
+    slug: str | None = None
     name: str | None = None
     product_type: str | None = None
     country: str | None = None
@@ -25,6 +29,7 @@ class Product(BaseModel):
     # Unknown is intentional: face value does not establish checkout price.
     available: bool | None = None
     quoted_total_cents: int | None = None
+    accepts_balance: bool | None = None
     purchase_blocker: str | None = 'quote_contract_unverified'
 
     @property
@@ -40,15 +45,18 @@ class Product(BaseModel):
 class Quote(BaseModel):
     """Internal integration contract. Never deserialize agent input into this type.
 
-    The live adapter cannot produce this until final cost/fees/availability/expiry
-    and payment currency fields are verified. Tests use normalized domain fixtures.
+    Live catalog quotes are indicative and final_charge_bounded=False. A local
+    freshness deadline provides no price lock. Tests use bounded domain fixtures.
     """
     model_config = ConfigDict(frozen=True)
     product: Product
     denomination: str
     total_cents: Money
     currency: Literal['USD']
-    payment_method: Literal['fiat_card']
+    payment_method: Literal['fiat_card', 'balance']
+    balance_currency: Literal['USD'] | None = None
+    # A bounded charge must be explicitly established by the server adapter.
+    final_charge_bounded: bool = False
     expires_at: datetime
 
     @field_validator('expires_at')
@@ -81,6 +89,7 @@ class ConfirmInput(Input):
     preview_fingerprint: Annotated[str, Field(pattern=r'^[a-f0-9]{64}$')]
     confirm: StrictBool
     recipient: SecretStr | None = None
+    acknowledge_uncertain_final_charge: StrictBool = False
 
     @field_validator('confirm')
     @classmethod
@@ -119,3 +128,15 @@ class ExecutionOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     last_checked_at: datetime | None
+
+
+class AccountBalance(BaseModel):
+    payment_method: Literal['balance'] = 'balance'
+    balance_currency: Literal['USD'] = 'USD'
+    amount_cents: Money
+
+
+class BalancePayment(BaseModel):
+    """Verified buy-products payment fields; never selects another sub-account."""
+    payment_method: Literal['balance'] = 'balance'
+    balance_currency: Literal['USD'] = 'USD'
