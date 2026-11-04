@@ -5,6 +5,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import OperationalError
 
+from app.api.zcash import router as zcash_router
+from app.integrations.zcash import ZalletAdapter, ZcashError
+
 from app.api.health import router as health_router
 from app.api.spending import router as spending_router
 from app.api.bitrefill import router as bitrefill_router
@@ -29,6 +32,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.settings = config
     application.state.database_engine = engine
     application.state.bitrefill_provider = BitrefillClient(config)
+    application.state.zcash_wallet = ZalletAdapter(config)
+
+    @application.exception_handler(ZcashError)
+    async def zcash_error(request: Request, exc: ZcashError):
+        return JSONResponse(status_code=503, content={"detail": {"code": exc.code,
+                            "message": "Zcash testnet wallet request could not be completed"}})
 
     @application.exception_handler(ProviderError)
     async def provider_error(request: Request, exc: ProviderError):
@@ -52,6 +61,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["GET", "POST"],
         allow_headers=["Accept", "Content-Type", "Authorization"],
     )
+    application.include_router(zcash_router)
     application.include_router(health_router)
     application.include_router(spending_router)
     application.include_router(bitrefill_router)

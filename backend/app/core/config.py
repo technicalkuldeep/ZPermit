@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator
@@ -28,6 +29,18 @@ class Settings(BaseSettings):
         "BITREFILL_LIVE_PURCHASES_ENABLED", "ZPERMIT_BITREFILL_LIVE_PURCHASES_ENABLED"))
     bitrefill_timeout_seconds: float = Field(default=10, ge=0.1, le=30)
     bitrefill_preview_ttl_seconds: int = Field(default=60, ge=1, le=300)
+
+    zcash_network: Literal["test"] = "test"
+    zcash_enabled: bool = False
+    zcash_live_broadcast_enabled: bool = False
+    zcash_zallet_binary: str = "/usr/local/bin/zallet"
+    zcash_zallet_config: str = ""
+    zcash_zallet_datadir: str = ""
+    zcash_zebra_rpc_url: str = "http://127.0.0.1:18232"
+    zcash_account_id: str = ""
+    zcash_source_address: str = ""
+    zcash_timeout_seconds: float = Field(default=15, ge=0.1, le=60)
+    zcash_request_ttl_seconds: int = Field(default=300, ge=1, le=900)
 
     @field_validator("dev_owner_id", "dev_agent_id")
     @classmethod

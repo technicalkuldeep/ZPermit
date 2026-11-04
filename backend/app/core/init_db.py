@@ -3,6 +3,7 @@
 create_all supports a fresh database, not migrations of existing tables.
 """
 from app.core.database import Base, get_engine
+from app.models import zcash  # noqa: F401: additive testnet tables
 from app.models import spending  # noqa: F401: register tables
 from app.models import bitrefill  # noqa: F401: register additive integration tables
 

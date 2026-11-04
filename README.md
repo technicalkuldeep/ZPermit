@@ -1,8 +1,8 @@
 # ZPermit
 
 Privacy-conscious AI spending authorization platform for the Free Society Hackathon.
-Milestones 1–3 provide FastAPI spending authorization and a server-owned Bitrefill
-integration boundary. **Live checkout remains blocked pending contract verification;
+Milestones 1–4 provide FastAPI spending authorization, a server-owned Bitrefill
+integration boundary, and an owner-confirmed NU7 testnet wallet adapter. **Live checkout remains blocked pending contract verification;
 no payments or purchases have been executed.**
 
 ## Installation and startup
@@ -271,8 +271,8 @@ backend/app/
 backend/tests/
 ```
 
-There is no frontend, Zcash, AI orchestration, payment execution, or fake purchase
-implementation. Bitrefill live checkout is explicitly blocked as explained below.
+There is no frontend, AI orchestration, or fake purchase implementation. Zcash
+testnet integration is described below; live wallet execution is not yet verified. Bitrefill live checkout is explicitly blocked as explained below.
 
 ## Milestone 3: Bitrefill discovery and guarded preparation
 
@@ -434,3 +434,53 @@ python -m app.integrations.verify_bitrefill
 
 This skips without a credential. With a credential it calls only search and
 details, prints a count and product ID, and never creates an invoice or pays.
+
+
+## Milestone 4: NU7 testnet wallet boundary
+
+**Implemented and unit-tested; no real transaction has been broadcast or txid
+produced.** The environment has no installed Zcash wallet/node or supplied funded
+wallet. [Compatibility report](backend/docs/zcash-compatibility.md) records the
+verified official tooling: Zallet `v0.1.0-beta.4` with co-located Zebra `v7.0.0`
+(built with `indexer`). No Zcash cryptography is implemented in Python.
+
+[Setup, live workflow, privacy and blockers](backend/docs/zcash-testnet.md) contains
+the exact environment variables, pinned install steps, local wallet configuration,
+funding requirements and owner confirmation flow. Rerun `python -m app.core.init_db`
+to add the independent testnet table before using payment routes.
+
+The subprocess adapter validates testnet UAs using Zallet, selects the Orchard
+receiver used for Ironwood payments, reads shielded balances in integer zatoshis,
+and checks the wallet against a synced NU7 testnet node. Owner-only
+`/api/zcash` routes prepare approval-required requests, confirm exact terms,
+persist operation IDs/txids and refresh transaction confirmations. Broadcast is
+disabled by default and requires both an environment flag and explicit owner
+confirmation. The agent has no Zcash route access. No seeds, spending keys or
+wallet-unlock secrets are accepted over HTTP.
+
+A durable claim precedes dispatch. Ambiguous results become uncertain; repeat
+confirmation never blindly resends. Wallet success without `broadcast=true` is
+not treated as a broadcast. There is no USD-to-ZEC conversion or Bitrefill
+settlement: test coins cannot fund real purchases, and existing spending controls
+and Bitrefill's contract-verification block remain intact.
+
+With a configured, synced and funded wallet, the read-only verification is:
+
+```bash
+cd backend
+source .venv/bin/activate
+python -m app.integrations.verify_zcash
+ZPERMIT_RUN_LIVE_TESTNET_READS=1 python -m pytest -q tests/test_zcash_live.py
+```
+
+Default unit tests use explicitly labeled doubles and never broadcast. The live
+pytest workflow only reads. Follow the linked guide for the separate interactive
+owner-confirmed payment workflow and independent node inspection of its genuine
+txid. Mentor assistance is still needed for the actual hackathon developer links,
+verified local wallet/node setup, Ironwood testnet funding, and live evidence.
+
+Shielding protects on-chain payment details, not the backend database: ZPermit
+stores owner, addresses, amount, transaction IDs and timestamps in plaintext
+SQLite. The wallet/operator sees payment details; public transaction timing, fees
+and action counts remain visible. Read the full privacy/trust explanation before
+sharing transaction evidence.
